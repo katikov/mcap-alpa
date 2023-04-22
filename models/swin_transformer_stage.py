@@ -18,10 +18,22 @@ class PatchMerging(nn.Module):
     # TODO: implement merging by convolution
     def setup(self):
         self.reduction = nn.Dense(self.output_channels, use_bias=False)
+        # patch_size = (2,) * self.dims
+        # self.conv = nn.Conv(self.output_channels, kernel_size=patch_size, strides=patch_size, use_bias=False)
         self.norm = self.norm_layer()
             
 
     def __call__(self, x):
+        # x = self.conv(x)
+        # x = self.norm(x)
+
+        # b, h, w, c = x.shape
+        # if (h % 2 == 1) or (w % 2 == 1):
+        #     x = jnp.pad(x, ((0, 0), (0, w%2), (0, h%2), (0, 0)) )
+        # b, h, w, c = x.shape
+        # x = x.reshape(b, h//2, 2, w//2, 2, c).transpose((0, 1, 3, 2, 4, 5)).reshape(b, h//2, w//2, c*4)
+
+        # x = jnp.concatenate([x[:, 0::2, 0::2, :], x[:, 0::2, 1::2, :], x[:, 1::2, 0::2, :], x[:, 1::2, 1::2, :]], axis=-1)
         if self.dims == 3:
             b, d, h, w, c = x.shape
             pad_input = (h % 2 == 1) or (w % 2 == 1) or (d % 2 == 1)
@@ -78,11 +90,14 @@ class SwinTransformerStage(nn.Module):
                 ]
 
 
-            ## TODO: downsample
+
             self.downsample = PatchMerging(input_channels=self.input_channels, 
                                         output_channels=self.output_channels,
                                         dims=self.dims,
                                         norm_layer=self.norm_layer)
+
+            # from .simple_unet import DownBlock
+            # self.downsample = DownBlock(in_channels=self.input_channels, out_channels=self.output_channels, dropout_rate=0.0)
 
 
             attn_mask = compute_mask(self.window_size, self.shift_size).reshape(

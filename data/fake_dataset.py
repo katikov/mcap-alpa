@@ -31,7 +31,7 @@ class FakeDataset(Dataset):
     def __getitem__(self, idx):
         img = self.images[idx]
         mask = self.masks[idx]
-        sample = img
-        target = mask
+        sample = img.copy()
+        target = mask.copy()
         return sample, target
 

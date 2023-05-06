@@ -1,45 +1,100 @@
-from torch.utils.data import DataLoader
 from alpa.model.model_util import TrainState
 import optax 
 import jax
 import tqdm
 import jax.numpy as jnp
+import numpy as np
 import flax.linen as nn
 import alpa 
 import ray
 from alpa import ManualStageOption
+from flax.training import checkpoints
+import os
+from sklearn.metrics import (roc_curve,
+                             auc, 
+                             f1_score,
+                             accuracy_score, 
+                             average_precision_score, 
+                             jaccard_score,
+                             roc_auc_score, 
+                             precision_recall_curve)
 
-from data import FakeDataset
+from data import load_fake_dataset, load_rfi_dataset
 from models import SwinUNETR, UNet
+from args import get_args
 
+def save_checkpoint(state, workdir):
+    alpa.prefetch(state)
+    state = alpa.util.map_to_nparray(state)
+    step = int(state.step)
+    checkpoints.save_checkpoint(workdir, state, step, keep=1)
+
+def restore_checkpoint(state, workdir):
+    if os.path.isdir(workdir):
+        files = os.listdir(workdir)
+        files = [os.path.join(workdir, i) for i in files if i.startswith("checkpoint")]
+        if len(files) == 0:
+            return state
+        timestamps = [os.path.getmtime(i) for i in files]
+        workdir = files[np.argmax(timestamps)]
+
+    return checkpoints.restore_checkpoint(workdir, state)
+
+# Define gradient update step fn
+def loss_fn(logits, labels):
+    loss = optax.sigmoid_binary_cross_entropy(logits, labels)
+    return loss.mean()
+
+def train_step(state, batch):
+
+    def compute_loss(params):
+        labels = batch['labels']
+        sample = batch['sample']
+        logits = state.apply_fn(params, sample)
+        loss = loss_fn(logits, labels)
+        return loss
+
+    grad_fn = alpa.value_and_grad(compute_loss)
+    # grad_fn = alpa.grad(compute_loss)
+    loss, grad = grad_fn(state.params)
+    new_state = state.apply_gradients(grads=grad)
+
+    metrics = {"loss": loss}
+    return new_state, metrics
+    
+def eval_step(state, sample):
+    logits = state.apply_fn(state.params, sample, train=False)
+    return logits
+
+    
 def main():
+    args = get_args()
+    print(args)
     ray.init()
     alpa.init(cluster="ray")
+    
+    # train_dataset, test_dataset, train_dataloader, test_dataloader = load_fake_dataset(batch_size = batch_size)
 
-    channel = 1
-    out_channel = 2
-    batch_size = 4
-    mbatch_size = 1
-    sample_size = 512
-    train_dataset = FakeDataset(dataset_size = 128 * 15)
-    test_dataset = FakeDataset(dataset_size = 128) 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_dataset, test_dataset, train_dataloader, test_dataloader = load_rfi_dataset(data_dir=args.data_dir, batch_size=args.batch_size)
+    train_length, test_length = len(train_dataset), len(test_dataset)
+    warmup_steps = train_length//args.batch_size * args.warmup_epochs
+    total_steps = train_length//args.batch_size * args.total_epochs
+    decay_steps = total_steps - warmup_steps
+
     # model = UNet()
-    model = SwinUNETR(num_layers=(2, 2, 18, 2), feature_size=96)
-    # img_size: Sequence[int] = (512, 512)
-    # in_channels: int = 1
-    # out_channels: int = 2
-    # num_layers: Sequence[int] = (2, 2, 2, 2)
+    model = SwinUNETR(img_size = (args.size_x, args.size_y), 
+                        in_channels = args.in_channels,
+                        out_channels = args.out_channels,
+                        num_layers = (2, 2, 18, 2), 
+                        feature_size=args.feature_size
+                    )
     # num_heads: Sequence[int] = (3, 6, 12, 24)
     # patch_size: Sequence[int] = (2, 2)
     # window_size: Sequence[int] = (7, 7)
-    # feature_size: int = 48  
     # use_v2: bool = False
     # mlp_ratio: float = 4.0
     # dtype: jnp.dtype = jnp.float32
     # qkv_bias: bool = True
-
     # dropout_rate: float = 0.0 
     # attn_dropout_rate: float = 0.0 
     # dropout_path_rate: float = 0.0 
@@ -47,72 +102,72 @@ def main():
     # norm_layer = nn.LayerNorm
 
     
-
+    
     rng = jax.random.PRNGKey(0)
-    sample = jnp.ones((batch_size, sample_size, sample_size, channel))
+    # rng, input_rng = jax.random.split(rng)
+    
+    sample = jnp.ones((args.batch_size, args.size_x, args.size_y, args.in_channels), dtype="float32")
     params = model.init(rng, sample)
 
 
     tabulate_fn = nn.tabulate(model, jax.random.PRNGKey(1))
     print(tabulate_fn(sample))
 
-    def loss_fn(logits, labels):
-        loss = optax.softmax_cross_entropy(logits, labels)
-        return loss.mean()
 
-    adamw = optax.adamw(learning_rate=1e-5)
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=adamw, dynamic_scale=None)
-
-    # Define gradient update step fn
-    def train_step(state, batch):
-
-        def compute_loss(params):
-            labels = batch['labels']
-            sample = batch['sample']
-            logits = state.apply_fn(params, sample)
-            loss = loss_fn(logits, labels)
-            return loss
     
-        grad_fn = alpa.value_and_grad(compute_loss)
-        # grad_fn = alpa.grad(compute_loss)
-        loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)
+    lr_scheduler = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=args.optim_lr, 
+                                        warmup_steps=warmup_steps, decay_steps=decay_steps)
 
-        metrics = {"loss": loss}
-        return new_state, metrics
+    adamw = optax.adamw(learning_rate=lr_scheduler, weight_decay=args.decay) # TODO: param
+
+    state = TrainState.create(apply_fn=model.apply, params=params, tx=adamw, dynamic_scale=None)
+    start_epoch = 0
+
+    if args.checkpoint is not None:
+        state = restore_checkpoint(state, args.checkpoint)
+        start_epoch = (int(state.step) + 1) // (train_length//args.batch_size)
+        print(f"Load from checkpoint, start epoch = {start_epoch}")
+
+
 
 
     # method=alpa.DataParallel()
-    # method = alpa.Zero2Parallel()
-    # method = alpa.ShardParallel(num_micro_batches=16)
+    method = alpa.Zero2Parallel()
+    # method = alpa.ShardParallel(num_micro_batches=batch_size//mbatch_size)
     # method = alpa.PipeshardParallel(num_micro_batches=1,
     #                             layer_option=alpa.AutoLayerOption(layer_num=4),
     #                             stage_option="auto")
 
 
-    # manual_stage = ManualStageOption(forward_stage_layer_ids = [[0], [1, 2], [3, 4, 5, 6, 7, 8, 9], [10, 11]],
+    # manual_stage = ManualStageOption(forward_stage_layer_ids = [[0], [1, 2, 3], [4, 5, 6, 7, 8, 9, 10], [11, 12, 13, 14, 15]],
     #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
     #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
-    #         submesh_autosharding_option_dicts= [{'force_batch_dim_to_mesh_dim': 0}, {'force_batch_dim_to_mesh_dim': 0}, {}, {}])
+    #         submesh_autosharding_option_dicts= [{}, {'force_batch_dim_to_mesh_dim': 0}, {}, {'force_batch_dim_to_mesh_dim': 0}])
 
 
 
     # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-    #                         layer_option=alpa.AutoLayerOption(layer_num=12),
+    #                         layer_option=alpa.AutoLayerOption(layer_num=16),
     #                         stage_option=manual_stage)
 
 
 
     
-    method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-                        layer_option=alpa.AutoLayerOption(layer_num=32),
-                        stage_option="auto")
+    # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
+    #                     layer_option=alpa.AutoLayerOption(layer_num=16),
+    #                     stage_option="auto")
 
-    # manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2], [3, 4, 5], [6, 7], [8, 9]],
+    # auto:
+    # manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2, 3], [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26], [27, 28, 29]],
     #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
     #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
-    #         submesh_autosharding_option_dicts = [{},{},{},{}])
-    #         #[{}, {'force_batch_dim_to_mesh_dim': 0}, {'force_batch_dim_to_mesh_dim': 0}, {}])
+    #         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
+
+    # balance
+    # manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], [24, 25, 26, 27, 28, 29]],
+    #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
+    #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
+    #         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
     # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
     #                     layer_option="manual",
     #                     stage_option=manual_stage)
@@ -126,41 +181,81 @@ def main():
                                 # donate_argnums=(0,)
                                 )
 
+    p_eval_step = alpa.parallelize(eval_step, donate_argnums=())
 
-    for epoch in range(3):
-        rng, input_rng = jax.random.split(rng)
-        train_step_progress_bar = tqdm.tqdm(total=len(train_dataset)//batch_size, desc="Training...")
+    for epoch in range(start_epoch, args.total_epochs):
+
+        train_step_progress_bar = tqdm.tqdm(total=len(train_dataset)//args.batch_size, desc="Training...")
         # train
         train_metrics = []
         for step, batch in enumerate(train_dataloader):
             batch = {"sample": jnp.array(batch[0]), "labels": jnp.array(batch[1])}
             state, train_metric = p_train_step(state, batch)
-            train_metrics.append(train_metric)
+            loss = train_metric["loss"]._value
+            print(f"epoch: {epoch}, step: {step}, loss: {loss}")
+            train_step_progress_bar.set_description(f"Training epoch: {epoch}, loss: {loss}")
             train_step_progress_bar.update(1)
             
         train_step_progress_bar.close()
 
-    
+        
+        if (epoch + 1) % args.val_every == 0:
+            if args.save_checkpoint:
+                save_checkpoint(state, "./checkpoints/")
+
+            acc_logit = []
+            acc_target = []
+            eval_step_progress_bar = tqdm.tqdm(total=len(test_dataset), desc=f"Eval epoch: {epoch}")
+            for step, batch in enumerate(test_dataloader):
+                labels = jnp.array(batch[1])
+                logits = p_eval_step(state, jnp.array(batch[0]))
+                logits = logits._value
+                
+                acc_logit.append(logits)
+                acc_target.append(labels)
+                eval_step_progress_bar.update(1)
+            eval_step_progress_bar.close()
+
+            acc_logit = jnp.concatenate(acc_logit).flatten()
+            acc_target = jnp.concatenate(acc_target).flatten() > 0.5
+
+            # acc = ((acc_logit > 0.5) == acc_target).astype("int32").mean()
+
+            fpr,tpr, thr = roc_curve(acc_target, acc_logit)
+            true_auroc = auc(fpr, tpr)
+
+            # AUPRC True 
+            precision, recall, thresholds = precision_recall_curve(acc_target, acc_logit)
+            true_auprc = auc(recall, precision)
+
+            f1_scores = 2*recall*precision/(recall+precision)
+            true_f1 = np.max(f1_scores)
+
+            print(f"true_auroc: {true_auroc}, true_auprc: {true_auprc}, true_f1: {true_f1}")
+
+
 
     # alpa_executable = p_train_step.get_last_executable()
+    batch = {"sample": jnp.ones((args.batch_size, args.size_x, args.size_y, args.in_channels), dtype="float32"), 
+                    "labels": jnp.ones((args.batch_size, args.size_x, args.size_y, args.out_channels), dtype="int32")}
+    if isinstance(method, (alpa.PipeshardParallel,)):
+        alpa_executable = p_train_step.get_executable(state, batch)
+        print(f"Alpa maximum GPU memory usage:   {alpa_executable.mesh_group.get_max_memory_allocated() / (2**30):.2f} GB")
+        def _get_mem_list(mesh_group):
+            calls = []
+            for mesh in mesh_group.meshes:
+                for worker in mesh.workers:
+                    print(type(worker), worker)
+                    calls.append(worker.get_list_memory_allocated.remote())
+            return list(ray.get(calls))
+        print(f"Alpa execution per GPU memory usage:   {[[j/ (2**30) for j in i] for i in _get_mem_list(alpa_executable.mesh_group)]}")
 
-    batch = {"sample": jnp.ones((batch_size, sample_size, sample_size, channel)), 
-                "labels": jnp.ones((batch_size, sample_size, sample_size, out_channel))}
-    alpa_executable = p_train_step.get_executable(state, batch)
-    print(f"Alpa maximum GPU memory usage:   {alpa_executable.mesh_group.get_max_memory_allocated() / (2**30):.2f} GB")
-    def _get_mem_list(mesh_group):
-        calls = []
-        for mesh in mesh_group.meshes:
-            for worker in mesh.workers:
-                print(type(worker), worker)
-                calls.append(worker.get_list_memory_allocated.remote())
-        return list(ray.get(calls))
-    print(f"Alpa execution per GPU memory usage:   {[[j/ (2**30) for j in i] for i in _get_mem_list(alpa_executable.mesh_group)]}")
+    else:
+        state, batch = p_train_step.preshard_dynamic_args(state, batch)
+        alpa_executable = p_train_step.get_executable(state, batch)
+        print(f"Alpa execution per GPU memory usage:   {alpa_executable.get_total_allocation_size() / (2**30):.2f} GB")
 
 
-    # state, batch = p_train_step.preshard_dynamic_args(state, batch)
-    # alpa_executable = p_train_step.get_executable(state, batch)
-    # print(f"Alpa execution per GPU memory usage:   {alpa_executable.get_total_allocation_size() / (2**30):.2f} GB")
 
 if __name__ == "__main__":
     main()

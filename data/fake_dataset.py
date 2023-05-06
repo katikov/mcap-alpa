@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import jax.numpy as jnp
 import numpy as np
 from typing import Tuple
@@ -16,7 +16,7 @@ class FakeDataset(Dataset):
 
 
         train_data = np.random.rand(dataset_size, *image_size, input_channels).astype(dtype)
-        train_masks = np.random.rand(dataset_size, *image_size, output_channels).astype(dtype)
+        train_masks = np.random.rand(dataset_size, *image_size, output_channels).astype("int32")
 
         self.length = dataset_size
         self.images = train_data 
@@ -34,4 +34,12 @@ class FakeDataset(Dataset):
         sample = img.copy()
         target = mask.copy()
         return sample, target
+
+
+def load_fake_dataset(train_size = 128, validate_size = 128, batch_size = 1):
+    train_dataset = FakeDataset(dataset_size = train_size)
+    validate_dataset = FakeDataset(dataset_size = validate_size) 
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    validate_dataloader = DataLoader(validate_dataset, batch_size=1, shuffle=False)
+    return (train_dataset, validate_dataset, train_dataloader, validate_dataloader)
 

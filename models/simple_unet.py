@@ -123,7 +123,7 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     in_channels: int = 1
-    out_channels: int = 2
+    out_channels: int = 1
     dropout_rate: float = 0.5
     layer_depth: int = 4
     hidden_channels: Tuple[int] = (32, 64, 128, 256)
@@ -151,7 +151,7 @@ class UNet(nn.Module):
         # outconv(single conv) + relu + softmax
         self.outconv = nn.Conv(self.out_channels, kernel_size=(1, 1), strides=(1, 1), dtype=self.dtype)
         self.out_activation = nn.activation.relu
-        self.out = nn.activation.softmax
+        # self.out = nn.activation.softmax
 
     def __call__(self, x, train=True):
         hiddens = []
@@ -171,6 +171,6 @@ class UNet(nn.Module):
 
         x = self.outconv(x)
         x = self.out_activation(x)
-        x = self.out(x)
+        # x = self.out(x)
 
         return x

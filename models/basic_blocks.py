@@ -65,9 +65,9 @@ class UnetResBlock(nn.Module):
 
     def setup(self):
         if self.dims == 2:
-            axes = (-2, -1)
+            axes = (-3, -2)
         elif self.dims == 3:
-            axes = (-3, -2, -1)
+            axes = (-4, -3, -2)
         self.downsample = self.input_channels != self.output_channels
         stride_np = np.atleast_1d(self.stride)
         if not np.all(stride_np == 1):
@@ -130,9 +130,9 @@ class UnetBasicBlock(nn.Module):
 
     def setup(self):
         if dims == 2:
-            axes = (-2, -1)
+            axes = (-3, -2)
         elif dims == 3:
-            axes = (-3, -2, -1)
+            axes = (-4, -3, -2)
 
         self.conv1 = nn.Conv(self.output_channels, self.kernel_size, strides=self.stride)
         if self.dropout:

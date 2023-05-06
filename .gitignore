@@ -1,3 +1,4 @@
 **/*.sh
 *.npy
 **/__pycache__/*
+checkpoints

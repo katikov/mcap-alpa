@@ -42,7 +42,7 @@ class PatchEmbed(nn.Module):
 class SwinUNETR(nn.Module):
     img_size: Sequence[int] = (512, 512)
     in_channels: int = 1
-    out_channels: int = 2
+    out_channels: int = 1
     num_layers: Sequence[int] = (2, 2, 2, 2)
     num_heads: Sequence[int] = (3, 6, 12, 24)
     patch_size: Sequence[int] = (2, 2)
@@ -84,7 +84,7 @@ class SwinUNETR(nn.Module):
             dropout_rate = self.dropout_rate
         )
 
-        self.x0_norm = self.norm_layer()
+        self.x0_norm = self.norm_layer(epsilon=1e-5)
         
         temp = [[] for i in range(self.num_stages)]
 
@@ -190,7 +190,7 @@ class SwinUNETR(nn.Module):
         x = self.patch_embed(x, train)
         x0_out = self.x0_norm(x) if self.normalize else x
         vit_out.append(x0_out)
-        # alpa.mark_pipeline_boundary()
+        alpa.mark_pipeline_boundary()
 
         for i in range(self.num_stages):
             for layer in self.vit_layers[i]:
@@ -203,11 +203,11 @@ class SwinUNETR(nn.Module):
 
         dec = self.encoder_last(vit_out[self.num_stages])
         dec = self.decoders[self.num_stages-1](dec, vit_out[self.num_stages-1])
-        # alpa.mark_pipeline_boundary()
+        alpa.mark_pipeline_boundary()
         for i in range(self.num_stages-2, -1, -1):
             enc = self.encoders[i](vit_out[i])
             dec = self.decoders[i](dec, enc)
-            # alpa.mark_pipeline_boundary()
+            alpa.mark_pipeline_boundary()
 
         enc = self.encoder_first(x_in)
         dec = self.decoder_last(dec, enc)

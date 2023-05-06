@@ -2,6 +2,8 @@ import flax.linen as nn
 import jax.numpy as jnp
 from typing import Sequence
 import numpy as np
+import alpa
+import jax
 
 
 from .swin_utils import window_partition, window_reverse
@@ -66,7 +68,8 @@ class WindowAttention(nn.Module):
             bias_shape = ((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), self.num_heads)
             # TODO: init bias with normal distribution     trunc_normal_(self.relative_position_bias_table, std=0.02)
             self.relative_position_bias_table = self.param('relative_position_bias_table', 
-                                                lambda rng, shape: jnp.zeros(shape), bias_shape)
+                                                lambda rng, shape: jax.random.normal(rng, shape=shape, dtype="float32"), 
+                                                bias_shape)
             
 
             coords_h = np.arange(self.window_size[0])
@@ -134,7 +137,7 @@ class SwinTransformerBlock(nn.Module):
 
     def setup(self):
         self.shifted = self.shift_size and any(i > 0 for i in self.shift_size)
-        self.norm1 = self.norm_layer()
+        self.norm1 = self.norm_layer(epsilon=1e-5, reduction_axes=(-3, -2, -1))
         self.attn = WindowAttention(
             output_channels = self.output_channels,
             window_size=self.window_size,
@@ -145,7 +148,7 @@ class SwinTransformerBlock(nn.Module):
         )
 
         self.drop_path = DropPath(self.dropout_path) if self.dropout_path > 0.0 else None
-        self.norm2 = self.norm_layer()
+        self.norm2 = self.norm_layer(epsilon=1e-5, reduction_axes=(-3, -2, -1))
         self.mlp_hidden_channels = int(self.output_channels * self.mlp_ratio)
         self.mlp = MLPBlock(input_channels=self.output_channels, 
                         hidden_channels=self.mlp_hidden_channels, 
@@ -156,8 +159,7 @@ class SwinTransformerBlock(nn.Module):
     def forward_part1(self, x, mask_matrix, train=True):
         x_shape = x.shape
         x = self.norm1(x)
-
-        if len(x_shape) == 4:
+        if len(self.window_size) == 2:
             b, h, w, c = x.shape
             # window_size, shift_size = get_window_size((h, w), self.window_size, self.shift_size)
             pad_l = pad_t = 0
@@ -170,9 +172,9 @@ class SwinTransformerBlock(nn.Module):
             pass # TODO: 3d models
 
         if self.shifted:
-            if len(x_shape) == 5:
+            if len(self.window_size) == 3:
                 shifted_x = jnp.roll(x, shift=(-self.shift_size[0], -self.shift_size[1], -self.shift_size[2]), axis=(1, 2, 3))
-            elif len(x_shape) == 4:
+            elif len(self.window_size) == 2:
                 shifted_x = jnp.roll(x, shift=(-self.shift_size[0], -self.shift_size[1]), axis=(1, 2))
             attn_mask = mask_matrix
         else:
@@ -180,22 +182,23 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = None
 
         x_windows = window_partition(shifted_x, self.window_size)
+        attn_windows = x_windows
         attn_windows = self.attn(x_windows, attn_mask, train)
         attn_windows = attn_windows.reshape(-1, *(self.window_size + (c,)) )
         shifted_x = window_reverse(attn_windows, self.window_size, dims)
 
         if self.shifted:
-            if len(x_shape) == 5:
+            if len(self.window_size) == 3:
                 x = jnp.roll(shifted_x, shift=(self.shift_size[0], self.shift_size[1], self.shift_size[2]), axis=(1, 2, 3))
-            elif len(x_shape) == 4:
+            elif len(self.window_size) == 2:
                 x = jnp.roll(shifted_x, shift=(self.shift_size[0], self.shift_size[1]), axis=(1, 2))
         else:
             x = shifted_x
 
-        if len(x_shape) == 5:
+        if len(self.window_size) == 3:
             if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
                 x = x[:, :d, :h, :w, :]
-        elif len(x_shape) == 4:
+        elif len(self.window_size) == 2:
             if pad_r > 0 or pad_b > 0:
                 x = x[:, :h, :w, :]
 
@@ -212,13 +215,17 @@ class SwinTransformerBlock(nn.Module):
 
     def __call__(self, x, mask_matrix, train=True):
         shortcut = x
+        
         x = self.forward_part1(x, mask_matrix, train)
+
+
         if self.drop_path:
             x = self.drop_path(x, train)
         x = x + shortcut
-
+        # alpa.mark_pipeline_boundary()
         
         x = x + self.forward_part2(x, train)
+        alpa.mark_pipeline_boundary()
         return x
 
 

@@ -222,7 +222,7 @@ class SwinTransformerBlock(nn.Module):
         if self.drop_path:
             x = self.drop_path(x, train)
         x = x + shortcut
-        # alpa.mark_pipeline_boundary()
+        alpa.mark_pipeline_boundary()
         
         x = x + self.forward_part2(x, train)
         alpa.mark_pipeline_boundary()

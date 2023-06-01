@@ -15,9 +15,29 @@ def get_args():
     parser.add_argument("--size_y", default=512, type=int, help="image size in y direction")
     parser.add_argument("--val_every", default=1, type=int, help="validation frequency")
     parser.add_argument("--feature_size", default=96, type=int, help="feature size")
-    parser.add_argument("--optim_lr", default=1e-4, type=float, help="optimization learning rate")
-    parser.add_argument("--decay", default=1e-4, type=float, help="decay weight")
+    parser.add_argument("--optim_lr", default=1e-5, type=float, help="optimization learning rate")
+    parser.add_argument("--decay", default=0.001, type=float, help="decay weight")
+    parser.add_argument("--parallel_method", default="pipeshard", help="parallel method") # TODO: add description
+    parser.add_argument("--stage_option", default="mcap", help="layer splitting method. valid only when parallel method is pipeshard")
+    parser.add_argument("--layer_option", default="auto", help="layer splitting option, either 'auto' or 'manual'")
+    parser.add_argument("--num_layers", default=16, type=int, help="number of auto layers.")
+    parser.add_argument("--num_gpus", default=4, type=int, help="number of gpus")
+    parser.add_argument("--debug", action="store_true", help="use debugging data")
+    parser.add_argument("--profiling_file", default=None, help="pickle file name of profiling data. requires a profiling step by default(None)")
+    parser.add_argument("--head_ip", default=None, help="head ip")
+    parser.add_argument("--head_port", default=None, help="head port")
+    parser.add_argument("--worker_list", default=None, help="worker list")
+    parser.add_argument("--reduced_profiling", action="store_true", help="profile with a smaller feature size")
+    parser.add_argument("--pipeline_schedule", default="1f1b", help="pipeline schedule, can be \"1f1b\", \"gpipe\" or \"inference\"")
+    # parser.add_argument("--gpus_per_node", default=4, type=int, help="number of gpus per node")
 
+    args = parser.parse_args()
+    if args.worker_list:
+        args.worker_list = args.worker_list.split()
+        args.gpus_per_node = args.num_gpus // len(args.worker_list)
+    return args
+
+    # TODO: check swin unetr params
     """
     orig swin unetr params
     parser.add_argument("--logdir", default="test", type=str, help="directory to save the tensorboard logs")
@@ -75,5 +95,3 @@ def get_args():
     parser.add_argument("--squared_dice", action="store_true", help="use squared Dice")
     parser.add_argument("--bce_loss", action="store_true", help="use bce loss")
     """
-    args = parser.parse_args()
-    return args

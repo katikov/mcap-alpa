@@ -7,9 +7,10 @@ import numpy as np
 import flax.linen as nn
 import alpa 
 import ray
-from alpa import ManualStageOption
 from flax.training import checkpoints
 import os
+import sys
+import pickle as pkl
 from sklearn.metrics import (roc_curve,
                              auc, 
                              f1_score,
@@ -22,10 +23,13 @@ from sklearn.metrics import (roc_curve,
 from data import load_fake_dataset, load_rfi_dataset
 from models import SwinUNETR, UNet
 from args import get_args
+from utils import get_parallel_method, get_mcap_stages
+from parallel.mcap_utils import custom_ray_start, custom_ray_stop
 
 def save_checkpoint(state, workdir):
     alpa.prefetch(state)
     state = alpa.util.map_to_nparray(state)
+
     step = int(state.step)
     checkpoints.save_checkpoint(workdir, state, step, keep=1)
 
@@ -64,18 +68,25 @@ def train_step(state, batch):
     
 def eval_step(state, sample):
     logits = state.apply_fn(state.params, sample, train=False)
+    logits = 1/(1 + jnp.exp(-logits))
+
     return logits
 
     
 def main():
     args = get_args()
-    print(args)
-    ray.init()
-    alpa.init(cluster="ray")
-    
-    # train_dataset, test_dataset, train_dataloader, test_dataloader = load_fake_dataset(batch_size = batch_size)
+    args.stages = (2, 2, 18, 2)
+    if args.debug:
+        args.warmup_epochs = 2
+        args.total_epochs = 5
+        train_dataset, test_dataset, train_dataloader, test_dataloader = load_fake_dataset(batch_size = args.batch_size, img_size = (args.size_x, args.size_y))
+    else:
+        train_dataset, test_dataset, train_dataloader, test_dataloader = load_rfi_dataset(data_dir=args.data_dir, 
+                                                                                        batch_size=args.batch_size,
+                                                                                        img_size = (args.size_x, args.size_y))
 
-    train_dataset, test_dataset, train_dataloader, test_dataloader = load_rfi_dataset(data_dir=args.data_dir, batch_size=args.batch_size)
+    print("training args:", args)
+
     train_length, test_length = len(train_dataset), len(test_dataset)
     warmup_steps = train_length//args.batch_size * args.warmup_epochs
     total_steps = train_length//args.batch_size * args.total_epochs
@@ -85,33 +96,26 @@ def main():
     model = SwinUNETR(img_size = (args.size_x, args.size_y), 
                         in_channels = args.in_channels,
                         out_channels = args.out_channels,
-                        num_layers = (2, 2, 18, 2), 
+                        num_layers = args.stages, 
                         feature_size=args.feature_size
                     )
-    # num_heads: Sequence[int] = (3, 6, 12, 24)
-    # patch_size: Sequence[int] = (2, 2)
-    # window_size: Sequence[int] = (7, 7)
-    # use_v2: bool = False
-    # mlp_ratio: float = 4.0
-    # dtype: jnp.dtype = jnp.float32
-    # qkv_bias: bool = True
-    # dropout_rate: float = 0.0 
-    # attn_dropout_rate: float = 0.0 
-    # dropout_path_rate: float = 0.0 
-    # normalize: bool = True
-    # norm_layer = nn.LayerNorm
 
-    
-    
+    if args.parallel_method == "pipeshard" and args.stage_option == "mcap":
+        args.mcap_layers = get_mcap_stages(args, model, train_step)
+    # args.mcap_layers = [[0, 1], [2, 3, 4], [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]]
+    # args.mcap_layers = [[0, 1, 2, 3], [4, 5, 6, 7, 8, 9, 10, 11], [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36], [37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]]   
+    # ray.init()
+    custom_ray_start(args) 
+    # alpa.init(cluster="ray")
     rng = jax.random.PRNGKey(0)
     # rng, input_rng = jax.random.split(rng)
     
     sample = jnp.ones((args.batch_size, args.size_x, args.size_y, args.in_channels), dtype="float32")
     params = model.init(rng, sample)
-
+    
 
     tabulate_fn = nn.tabulate(model, jax.random.PRNGKey(1))
-    print(tabulate_fn(sample))
+    # print(tabulate_fn(sample), sys.stderr)
 
 
     
@@ -119,6 +123,8 @@ def main():
                                         warmup_steps=warmup_steps, decay_steps=decay_steps)
 
     adamw = optax.adamw(learning_rate=lr_scheduler, weight_decay=args.decay) # TODO: param
+
+
 
     state = TrainState.create(apply_fn=model.apply, params=params, tx=adamw, dynamic_scale=None)
     start_epoch = 0
@@ -128,60 +134,15 @@ def main():
         start_epoch = (int(state.step) + 1) // (train_length//args.batch_size)
         print(f"Load from checkpoint, start epoch = {start_epoch}")
 
-
-
-
-    # method=alpa.DataParallel()
-    method = alpa.Zero2Parallel()
-    # method = alpa.ShardParallel(num_micro_batches=batch_size//mbatch_size)
-    # method = alpa.PipeshardParallel(num_micro_batches=1,
-    #                             layer_option=alpa.AutoLayerOption(layer_num=4),
-    #                             stage_option="auto")
-
-
-    # manual_stage = ManualStageOption(forward_stage_layer_ids = [[0], [1, 2, 3], [4, 5, 6, 7, 8, 9, 10], [11, 12, 13, 14, 15]],
-    #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
-    #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
-    #         submesh_autosharding_option_dicts= [{}, {'force_batch_dim_to_mesh_dim': 0}, {}, {'force_batch_dim_to_mesh_dim': 0}])
-
-
-
-    # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-    #                         layer_option=alpa.AutoLayerOption(layer_num=16),
-    #                         stage_option=manual_stage)
-
-
-
-    
-    # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-    #                     layer_option=alpa.AutoLayerOption(layer_num=16),
-    #                     stage_option="auto")
-
-    # auto:
-    # manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2, 3], [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26], [27, 28, 29]],
-    #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
-    #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
-    #         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
-
-    # balance
-    # manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], [24, 25, 26, 27, 28, 29]],
-    #         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
-    #         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
-    #         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
-    # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-    #                     layer_option="manual",
-    #                     stage_option=manual_stage)
-
-    # method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
-    #                      layer_option="manual",
-    #                      stage_option="auto")
-                        
-    p_train_step = alpa.parallelize(train_step,
-                                method=method,
-                                # donate_argnums=(0,)
-                                )
+    method = get_parallel_method(args, state, train_step, train_dataloader)
+    # method = alpa.PipeshardParallel(num_micro_batches=args.batch_size//args.mbatch_size,
+    #             layer_option="manual",
+    #             stage_option="auto")                 
+    p_train_step = alpa.parallelize(train_step, method=method)
 
     p_eval_step = alpa.parallelize(eval_step, donate_argnums=())
+
+
 
     for epoch in range(start_epoch, args.total_epochs):
 
@@ -192,21 +153,26 @@ def main():
             batch = {"sample": jnp.array(batch[0]), "labels": jnp.array(batch[1])}
             state, train_metric = p_train_step(state, batch)
             loss = train_metric["loss"]._value
-            print(f"epoch: {epoch}, step: {step}, loss: {loss}")
+            train_metrics.append(loss)
+            # print(f"epoch: {epoch}, step: {step}, loss: {loss}")
             train_step_progress_bar.set_description(f"Training epoch: {epoch}, loss: {loss}")
             train_step_progress_bar.update(1)
             
         train_step_progress_bar.close()
 
-        
-        if (epoch + 1) % args.val_every == 0:
+        avg_loss = np.mean(train_metrics)
+        print(f"epoch: {epoch}, train loss: {avg_loss}")
+
+        if args.val_every > 0 and (epoch + 1) % args.val_every == 0:
             if args.save_checkpoint:
                 save_checkpoint(state, "./checkpoints/")
 
             acc_logit = []
             acc_target = []
+            acc_data = []
             eval_step_progress_bar = tqdm.tqdm(total=len(test_dataset), desc=f"Eval epoch: {epoch}")
             for step, batch in enumerate(test_dataloader):
+                acc_data.append(jnp.array(batch[0]).copy())
                 labels = jnp.array(batch[1])
                 logits = p_eval_step(state, jnp.array(batch[0]))
                 logits = logits._value
@@ -216,8 +182,15 @@ def main():
                 eval_step_progress_bar.update(1)
             eval_step_progress_bar.close()
 
-            acc_logit = jnp.concatenate(acc_logit).flatten()
-            acc_target = jnp.concatenate(acc_target).flatten() > 0.5
+            acc_logit = jnp.concatenate(acc_logit)
+            acc_target = jnp.concatenate(acc_target)
+            acc_data = jnp.concatenate(acc_data)
+            with open("result.pkl", "wb") as f:
+                # pkl.dump([np.array(i) for i in [acc_logit, acc_target, acc_data]], f)
+                pkl.dump(np.array(acc_logit), f)
+
+            acc_logit = acc_logit.flatten()
+            acc_target = acc_target.flatten() > 0.5
 
             # acc = ((acc_logit > 0.5) == acc_target).astype("int32").mean()
 
@@ -229,9 +202,10 @@ def main():
             true_auprc = auc(recall, precision)
 
             f1_scores = 2*recall*precision/(recall+precision)
-            true_f1 = np.max(f1_scores)
+            f1_scores[jnp.isnan(f1_scores)] = 0.0
+            true_f1 = jnp.max(f1_scores)
 
-            print(f"true_auroc: {true_auroc}, true_auprc: {true_auprc}, true_f1: {true_f1}")
+            print(f"epoch: {epoch}, true_auroc: {true_auroc}, true_auprc: {true_auprc}, true_f1: {true_f1}")
 
 
 
@@ -239,7 +213,8 @@ def main():
     batch = {"sample": jnp.ones((args.batch_size, args.size_x, args.size_y, args.in_channels), dtype="float32"), 
                     "labels": jnp.ones((args.batch_size, args.size_x, args.size_y, args.out_channels), dtype="int32")}
     if isinstance(method, (alpa.PipeshardParallel,)):
-        alpa_executable = p_train_step.get_executable(state, batch)
+        # alpa_executable = p_train_step.get_executable(state, batch)
+        alpa_executable = p_train_step.get_last_executable()
         print(f"Alpa maximum GPU memory usage:   {alpa_executable.mesh_group.get_max_memory_allocated() / (2**30):.2f} GB")
         def _get_mem_list(mesh_group):
             calls = []
@@ -261,3 +236,23 @@ if __name__ == "__main__":
     main()
 
 
+
+# TODO:
+# auto:
+# manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2, 3], [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26], [27, 28, 29]],
+#         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
+#         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
+#         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
+
+# balance
+# manual_stage = ManualStageOption(forward_stage_layer_ids =  [[0, 1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], [24, 25, 26, 27, 28, 29]],
+#         submesh_physical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)], 
+#         submesh_logical_shapes=[(1, 1), (1, 1), (1, 1), (1, 1)],
+#         submesh_autosharding_option_dicts = [{},{},{},{'force_batch_dim_to_mesh_dim': 0}])
+# method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
+#                     layer_option="manual",
+#                     stage_option=manual_stage)
+
+# method = alpa.PipeshardParallel(num_micro_batches=batch_size//mbatch_size,
+#                      layer_option="manual",
+#                      stage_option="auto")

@@ -8,14 +8,15 @@ from models import SwinUNETR, UNet
 def get_parallel_method(args, state, train_step, sample_dataloader):
     method = None
     if args.parallel_method == "data":
-        method = alpa.DataParallel()
+        method = (alpa.DataParallel(), None)
     elif args.parallel_method == "zero2":
-        method = alpa.Zero2Parallel()
+        # method = (alpa.ShardParallel(num_micro_batches=1), alpa.ShardParallel(num_micro_batches=1))
+        method = (alpa.Zero2Parallel(), None)
 
     elif args.parallel_method == "pipeshard":
         layer_option=alpa.AutoLayerOption(layer_num=args.num_layers) if (args.layer_option == "auto") else "manual"
         stage_option = "auto"
-        if args.stage_option == "mcap": # TODO: get option with benchmarks
+        if args.stage_option == "mcap":
             stage_option = ManualStageOption(forward_stage_layer_ids=args.mcap_layers,
                 submesh_physical_shapes = [(1, 1)] * args.num_gpus,
                 submesh_logical_shapes = [(1, 1)] * args.num_gpus,
@@ -40,10 +41,15 @@ def get_parallel_method(args, state, train_step, sample_dataloader):
         #     pass
         
 
-        method = alpa.PipeshardParallel(num_micro_batches=args.batch_size//args.mbatch_size,
+        method = (alpa.PipeshardParallel(num_micro_batches=args.batch_size//args.mbatch_size,
                     layer_option=layer_option,
                     stage_option=stage_option, 
-                    pipeline_schedule=args.pipeline_schedule)
+                    pipeline_schedule=args.pipeline_schedule), 
+                 alpa.PipeshardParallel(num_micro_batches=1,
+                    layer_option=layer_option,
+                    stage_option=stage_option, 
+                    pipeline_schedule="inference")
+                )
         
     return method
 
@@ -66,12 +72,27 @@ def get_mcap_stages(args, model, train_step):
     # args.size_x //= 4
     # args.size_y //= 4
     print("benchmarking args:", args)
-    model = SwinUNETR(img_size = (args.size_x, args.size_y), 
+    img_size = (args.size_x, args.size_y)
+    
+    model = SwinUNETR(img_size = img_size, 
                     in_channels = args.in_channels,
                     out_channels = args.out_channels,
                     num_layers = args.stages, 
                     feature_size=args.feature_size
                 )
-    train_dataset, test_dataset, train_dataloader, test_dataloader = load_fake_dataset(batch_size = args.batch_size, img_size = (args.size_x, args.size_y))
-    stages = run_mcap(args, model, train_dataloader, train_step)
+
+    n_mbatches = args.batch_size // args.mbatch_size
+    if args.linear_predict:
+        # generate 2 datasets with batch size 1x and 2x mbatch size.
+        # reuse the fake dataset generator
+        length = 2
+        dataloaders = [load_fake_dataset(batch_size = args.mbatch_size * (i+1), img_size = img_size)[2] for i in range(length)]
+        args = [copy.deepcopy(args) for _ in range(length)]
+        for i in range(length):
+            args[i].batch_size = args[i].mbatch_size * (i+1)
+        
+        stages = run_mcap(args, model, dataloaders, train_step, n_mbatches)
+    else:
+        train_dataset, test_dataset, train_dataloader, test_dataloader = load_fake_dataset(batch_size = args.batch_size, img_size = img_size)
+        stages = run_mcap([args], model, [train_dataloader], train_step, n_mbatches)
     return stages

@@ -106,7 +106,10 @@ class WindowAttention(nn.Module):
         attn = attn + relative_position_bias
         
         if mask is not None:
-            attn = attn + mask
+            # attn = attn + mask
+            nw = mask.shape[0]
+            attn = attn.reshape(b // nw, nw, self.num_heads, n, n) + jnp.expand_dims(jnp.expand_dims(mask, 1), 0)
+            attn = attn.reshape(-1, self.num_heads, n, n)
         
         attn = self.softmax(attn)  # b, num_heads, n, n
         
@@ -222,10 +225,10 @@ class SwinTransformerBlock(nn.Module):
         if self.drop_path:
             x = self.drop_path(x, train)
         x = x + shortcut
-        alpa.mark_pipeline_boundary()
+        # alpa.mark_pipeline_boundary()
         
         x = x + self.forward_part2(x, train)
-        alpa.mark_pipeline_boundary()
+        # alpa.mark_pipeline_boundary()
         return x
 
 

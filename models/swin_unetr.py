@@ -6,6 +6,7 @@ import numpy as np
 import alpa
 from .swin_transformer_stage import SwinTransformerStage
 from .basic_blocks import UnetrBasicBlock, UnetrUpBlock
+import math
 
 """
 code from MONAI Swin UnetR:
@@ -102,7 +103,6 @@ class SwinUNETR(nn.Module):
                     )
                 temp[i].append(layerc)
 
-
             layer = SwinTransformerStage(
                 input_channels=input_channels,
                 output_channels=output_channels,
@@ -114,7 +114,8 @@ class SwinUNETR(nn.Module):
                 qkv_bias=self.qkv_bias,
                 dropout_rate=self.dropout_rate,
                 attn_dropout_rate=self.attn_dropout_rate,
-                norm_layer=self.norm_layer
+                norm_layer=self.norm_layer,
+                img_size=[math.ceil(d/(2 ** (i+1))) for d in self.img_size]
             )
 
             # from .simple_unet import DownBlock
@@ -190,24 +191,23 @@ class SwinUNETR(nn.Module):
         x = self.patch_embed(x, train)
         x0_out = self.x0_norm(x) if self.normalize else x
         vit_out.append(x0_out)
-        alpa.mark_pipeline_boundary()
+        # alpa.mark_pipeline_boundary()
 
         for i in range(self.num_stages):
             for layer in self.vit_layers[i]:
                 x = layer(x, train)
             x_out = self.norms[i](x)
-            # alpa.mark_pipeline_boundary()
             vit_out.append(x_out)
 
             
 
         dec = self.encoder_last(vit_out[self.num_stages])
         dec = self.decoders[self.num_stages-1](dec, vit_out[self.num_stages-1])
-        alpa.mark_pipeline_boundary()
+        # alpa.mark_pipeline_boundary()
         for i in range(self.num_stages-2, -1, -1):
             enc = self.encoders[i](vit_out[i])
             dec = self.decoders[i](dec, enc)
-            alpa.mark_pipeline_boundary()
+            # alpa.mark_pipeline_boundary()
 
         enc = self.encoder_first(x_in)
         dec = self.decoder_last(dec, enc)

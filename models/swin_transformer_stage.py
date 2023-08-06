@@ -57,6 +57,7 @@ class PatchMerging(nn.Module):
 
 
 class SwinTransformerStage(nn.Module):
+        img_size: Sequence[int]
         input_channels: int
         output_channels: int
         num_layers: int
@@ -99,14 +100,15 @@ class SwinTransformerStage(nn.Module):
             # from .simple_unet import DownBlock
             # self.downsample = DownBlock(in_channels=self.input_channels, out_channels=self.output_channels, dropout_rate=0.0)
 
+            attn_mask = compute_mask(self.img_size, self.window_size, self.shift_size)
 
-            attn_mask = compute_mask(self.window_size, self.shift_size).reshape(
-                                1,1,np.prod(self.window_size), np.prod(self.window_size))
+            # .reshape(1,1,np.prod(self.window_size), np.prod(self.window_size))
 
             self.attn_mask = jnp.array(attn_mask)
 
 
         def __call__(self, x, train=True):
+            
             for blk in self.blocks:
                 x = blk(x, self.attn_mask)
             x = self.downsample(x)

@@ -2,6 +2,7 @@ import numpy as np
 import flax.linen as nn
 import jax.numpy as jnp
 from typing import Sequence
+import math
 
 def window_partition(x, window_size):
     x
@@ -48,34 +49,60 @@ def window_reverse(windows, window_size, dims):
         x = x.transpose(0, 1, 3, 2, 4, 5).reshape((b, h, w, -1))
     return x
 
+# def compute_mask(dims, window_size, shift_size):
+#     cnt = 0
+#     img_mask = np.zeros((window_size))
+#     if len(window_size) == 3:
+#         for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
+#             for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
+#                 for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2], None):
+#                     img_mask[d, h, w] = cnt
+#                     cnt += 1
 
-def compute_mask(window_size, shift_size):
+#     elif len(window_size) == 2:
+#         for h in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
+#             for w in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
+#                 img_mask[h, w] = cnt
+#                 cnt += 1
+
+#     # print(img_mask)
+#     mask_windows = img_mask.reshape(-1)
+    
+#     attn_mask = np.expand_dims(mask_windows, 0) - np.expand_dims(mask_windows, 1)# mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+#     attn_mask[attn_mask != 0] = float(-100.0)
+#     attn_mask[attn_mask == 0] = float(0.0)
+
+#     return attn_mask
+
+
+def compute_mask(dims, window_size, shift_size):
     cnt = 0
-    img_mask = np.zeros((window_size))
+    dims = [math.ceil(d/w)*w for d, w in zip(dims, window_size)]
+    img_mask = np.zeros((1, *(dims), 1))
     if len(window_size) == 3:
         for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
             for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
                 for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2], None):
-                    img_mask[d, h, w] = cnt
+                    img_mask[:, d, h, w, :] = cnt
                     cnt += 1
 
     elif len(window_size) == 2:
         for h in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
             for w in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
-                img_mask[h, w] = cnt
+                img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-    # print(img_mask)
-    mask_windows = img_mask.reshape(-1)
-    
-    attn_mask = np.expand_dims(mask_windows, 0) - np.expand_dims(mask_windows, 1)# mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    mask_windows = window_partition(img_mask, window_size)
+    mask_windows = mask_windows.squeeze(-1)
+
+    attn_mask = np.expand_dims(mask_windows, 1) - np.expand_dims(mask_windows, 2)# mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
     attn_mask[attn_mask != 0] = float(-100.0)
     attn_mask[attn_mask == 0] = float(0.0)
-
     return attn_mask
+    # return np.expand_dims(np.expand_dims(attn_mask, 1), 0)
 
 
 
 if __name__ == "__main__":
-    a = compute_mask((5,5), (2,2))
+    a = compute_mask((12, 12), (5,5), (2,2))
     print(a, a.shape)

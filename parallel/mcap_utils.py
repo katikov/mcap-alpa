@@ -39,7 +39,7 @@ def custom_ray_start(args):
             # command2 = f"""srun --nodes=1 --ntasks=1 -w "{node_i}" \
             #     ifconfig """
             # os.system(command2)
-        
+    
         time.sleep(5)
     else:
         subprocess.run(["ray", "stop", "--force"], stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.PIPE, timeout = 20)
@@ -48,29 +48,16 @@ def custom_ray_start(args):
     alpa.init(cluster="ray")
 
 
-
-
-# # Start worker nodes
-# # Number of nodes other than the head node
-# worker_num=$((SLURM_JOB_NUM_NODES - 1))
-# # Iterate on each node other than head node, start ray worker and connect to HEAD
-# for ((i = 1; i <= worker_num; i++)); do
-#     node_i=${nodes_array[$i]}
-#     echo "Starting WORKER $i at $node_i"
-
-#     sleep 5
-# done
 def custom_ray_stop(args):
     if args.worker_list:
         for p in ray_list:
             p.kill()
         time.sleep(5)
-        
-        # for node_i in args.worker_list:
-        #     command = f"srun --nodes=1 --ntasks=1 -w \"{node_i}\" ray stop --force"
-        #     os.system(command)
+        # pass
     else:
         ray.shutdown()
+
+
 
 def evenly_distribute(n_gpus, n_layers):
     if n_gpus == 0 or n_layers == 0:

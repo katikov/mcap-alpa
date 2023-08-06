@@ -234,7 +234,7 @@ def generate_partitionings(n_layers, n_gpus):
 
 # Predict the peak memory usage for a given partitioning,
 # using mem_isolated and mem_added.
-def predict(partitioning, mem_stats):
+def predict_old(partitioning, mem_stats):
     result = []
     start = 0
 
@@ -248,6 +248,146 @@ def predict(partitioning, mem_stats):
         result.append(mem)
 
     return result
+
+
+# fit a linear function: f(x) = kx + b with f(1) and f(2)
+def linear_func(data, pmim):
+    k = data[1] - data[0]
+    b = data[0] - k 
+    return b + k*pmim
+
+# def predict_linear(partitioning, mem_stats, ending_stats, n_mbatches):
+#     result = []
+#     start = 0
+#     n_gpus = len(partitioning)
+
+#     for gpu_id, layers in enumerate(partitioning):
+#         pmim = min(n_mbatches, n_gpus - gpu_id)
+#         mem_data = [stat[start]["mem_isolated"] for stat in mem_stats]
+#         mem = linear_func(mem_data, pmim)
+#         for i in range(start+1, start+layers):
+#             # endings
+#             if (gpu_id == n_gpus-1) and (i-1 in ending_stats[0]):
+#                 ending_stats = ending_stats[0] if n_mbatches == 1 else ending_stats[1]
+#                 mem_data = [stat[i-1]["mem_isolated"] for stat in mem_stats]
+#                 mem += ending_stats[i-1] - linear_func(mem_data, pmim)
+#                 break
+
+#             mem_data = [stat[i]["mem_added"] for stat in mem_stats]
+#             mem += linear_func(mem_data, pmim)
+
+#         start += layers
+#         result.append(mem)
+
+#     return result
+
+
+# TODO: split linear and non-linear
+# general version of predict
+def predict(partitioning, mem_stats, ending_stats, n_mbatches, linear, endings, schedule):
+    result = []
+    start = 0
+    n_gpus = len(partitioning)
+
+    for gpu_id, layers in enumerate(partitioning):
+        pmim = min(n_mbatches, n_gpus - gpu_id) if schedule == "1f1b" else n_mbatches
+        if linear:
+            mem_data = [stat[start]["mem_isolated"] for stat in mem_stats]
+            mem = linear_func(mem_data, pmim)
+        else:
+            mem = mem_stats[0][start]["mem_isolated"]
+        for i in range(start+1, start+layers):
+            # endings
+            if endings and (gpu_id == n_gpus-1) and (i-1 in ending_stats[0]):
+                if linear:
+                    mem_data = [stat[i-1]["mem_isolated"] for stat in mem_stats]
+                    mem -= linear_func(mem_data, pmim)
+
+                    if schedule == "1f1b":
+                        ending_stats = ending_stats[0] if n_mbatches == 1 else ending_stats[1]
+                        mem += ending_stats[i-1]
+                    else:
+                        mem_data = [stat[i-1] for stat in ending_stats]
+                        mem += linear_func(mem_data, pmim)
+                else:
+                    ending_stats = ending_stats[0]
+                    mem += ending_stats[i-1] - mem_stats[0][i-1]["mem_isolated"]
+                break
+            
+            if linear:
+                mem_data = [stat[i]["mem_added"] for stat in mem_stats]
+                mem += linear_func(mem_data, pmim)
+            else:
+                mem += mem_stats[0][i]["mem_added"]
+
+        start += layers
+        result.append(mem)
+
+    return result
+
+def greedy_partition(mem_stats, ending_stats, n_mbatches, n_gpus, threshold, linear, endings, schedule):
+    partitioning, prediction = [], []
+    pos = 0
+    n_layers = len(mem_stats[0])
+
+    # first k-1 layers
+    for gpu_id in range(n_gpus-1):
+        pmim = min(n_mbatches, n_gpus - gpu_id) if schedule == "1f1b" else n_mbatches
+        if linear:
+            mem_data = [stat[pos]["mem_isolated"] for stat in mem_stats]
+            mem = linear_func(mem_data, pmim)
+        else:
+            mem = mem_stats[0][pos]["mem_isolated"]
+        stage = [pos]
+        pos += 1
+        while pos < n_layers + gpu_id - n_gpus + 1:
+            if linear:
+                mem_data = [stat[pos]["mem_added"] for stat in mem_stats]
+                mem_pos = linear_func(mem_data, pmim)
+            else:
+                mem_pos = mem_stats[0][pos]["mem_added"]
+
+            if mem + mem_pos <= threshold:
+                mem += mem_pos
+                stage.append(pos)
+                pos += 1
+            else:
+                break
+        partitioning.append(stage)
+        prediction.append(mem)
+
+    # last layer
+    partitioning.append(list(range(pos, n_layers)))
+    pmim = 1 if schedule == "1f1b" else n_mbatches
+    if linear:
+        mem_data = [stat[pos]["mem_isolated"] for stat in mem_stats]
+        mem = linear_func(mem_data, pmim)
+    else:
+        mem = mem_stats[0][pos]["mem_isolated"]
+
+    for i in range(pos+1, n_layers):
+        if endings and (i-1 in ending_stats[0]):
+            if linear:
+                mem_data = [stat[i-1]["mem_isolated"] for stat in mem_stats]
+                mem -= linear_func(mem_data, pmim)
+                if schedule == "1f1b":
+                    ending_stats = ending_stats[0] if n_mbatches == 1 else ending_stats[1]
+                    mem += ending_stats[i-1]
+                else:
+                    mem_data = [stat[i-1] for stat in ending_stats]
+                    mem += linear_func(mem_data, pmim)
+
+            else:
+                mem += ending_stats[0][i-1] - mem_stats[0][i-1]["mem_isolated"]
+            break
+        if linear:
+            mem_data = [stat[i]["mem_added"] for stat in mem_stats]
+            mem += linear_func(mem_data, pmim)
+        else:
+            mem += mem_stats[0][i]["mem_added"]
+    prediction.append(mem)
+    
+    return partitioning, prediction
 
 
 # A faster version of predict() that implements early stopping:
@@ -301,25 +441,25 @@ def percent_to_layers(params, n_layers):
 
 # Predict the peak memory usage for a given partitioning,
 # using mem_isolated and mem_added.
-def predict_bo(params):
-    global global_n_layers
-    global global_mem_stats
+# def predict_bo(params):
+#     global global_n_layers
+#     global global_mem_stats
 
-    # The bayesian optimization package does not support integer parameter values, so it
-    # gives floats. Convert to integers first.
-    # This approach is recommended in: https://github.com/fmfn/BayesianOptimization/blob/master/examples/advanced-tour.ipynb
-    partitioning = percent_to_layers(params, global_n_layers)
+#     # The bayesian optimization package does not support integer parameter values, so it
+#     # gives floats. Convert to integers first.
+#     # This approach is recommended in: https://github.com/fmfn/BayesianOptimization/blob/master/examples/advanced-tour.ipynb
+#     partitioning = percent_to_layers(params, global_n_layers)
 
-    # Check if parameters within bounds (sum equal to n_layers). Return a high value if not
-    # within bounds so that this part of the search space is unlikely to be explored further.
-    if sum(partitioning) != global_n_layers:
-        return 1000
+#     # Check if parameters within bounds (sum equal to n_layers). Return a high value if not
+#     # within bounds so that this part of the search space is unlikely to be explored further.
+#     if sum(partitioning) != global_n_layers:
+#         return 1000
 
-    # Predict memory usage for this partitioning.
-    prediction = predict(partitioning, global_mem_stats)
+#     # Predict memory usage for this partitioning.
+#     prediction = predict(partitioning, global_mem_stats)
 
-    # Return peak memory usage across all GPUs.
-    return max(prediction)
+#     # Return peak memory usage across all GPUs.
+#     return max(prediction)
 
 # Convert a partitioning in the 'cutpoints' representation to
 # the 'layers' representation.
@@ -387,11 +527,13 @@ def tie_breaker(results, best_indices, n_gpus):
     # pick the first one/random, since all remaining results are equal.
     return best_indices[0]
 
+
 # Find the best memory-balanced partitioning.
 # If predictor == 'bf', this function predicts the peak memory usage for all
 # possible partitionings  and picks the best balanced one (brute-force).
 # If predictor == 'bo', it uses bayesian optimization to navigate the search space.
-def find_balanced_partitioning(mem_stats, n_layers=24, n_gpus=8, predictor='bf'):
+"""
+def find_balanced_partitioning_old(mem_stats, n_layers=24, n_gpus=8, predictor='bf'):
 
     # Brute-force:
     if predictor == 'bf':
@@ -424,7 +566,6 @@ def find_balanced_partitioning(mem_stats, n_layers=24, n_gpus=8, predictor='bf')
         # Print the result.
         print_bf_result(results, best_i, end-start)
         partitioning = convert_to_forward_layers(results[best_i][0])
-
 
     else:
         # Bayesian optimization:
@@ -459,6 +600,113 @@ def find_balanced_partitioning(mem_stats, n_layers=24, n_gpus=8, predictor='bf')
         partitioning = percent_to_layers(opt.get_result().x, n_layers)
 
     return partitioning
+
+def find_balanced_partitioning_linear(mem_stats, ending_stats, n_mbatches, n_layers=24, n_gpus=8, predictor='bf'):
+
+    # Brute-force:
+    if predictor == 'bf':
+        start = time.time()
+        results = []
+        best_peak = math.inf
+        best_i = []
+        for i, partitioning in enumerate(generate_partitionings(n_layers, n_gpus)):
+            prediction = predict_linear(partitioning, mem_stats, ending_stats, n_mbatches)
+            # prediction = predict_early_stop(partitioning, mem_stats, best_peak)
+            peak = max(prediction)
+
+            if peak < best_peak:
+                # Reset list with best results.
+                best_i = [i]
+                best_peak = peak
+            elif peak == best_peak:
+                # Add to list of best results, so we can apply tie-breaking rule later.
+                best_i.append(i)
+        
+            results.append((partitioning, prediction))
+        # Apply the tie-breaker rule if there are multiple partitionings
+        # with the same highest peak memory usage.
+        best_i = tie_breaker(results, best_i, n_gpus)
+
+        end = time.time()
+
+        # Print the result.
+        print_bf_result(results, best_i, end-start)
+        partitioning = convert_to_forward_layers(results[best_i][0])
+    else:
+        start = time.time()
+        l, r = 0, 2**60 # binary search
+        # try to load memory on gpus in the begining, if there is a tie
+        while l <= r:
+            mid = (l + r) // 2
+            layers, pred = greedy_partition(mem_stats, ending_stats, n_mbatches, n_gpus, mid)
+            peak = max(pred)
+            if peak > mid:
+                l = mid + 1
+            else:
+                r = mid - 1
+                partitioning = layers
+                prediction = pred
+
+        end = time.time()
+        print_predictor_result(partitioning, prediction, max(prediction), end-start)
+    
+    return partitioning
+"""
+
+# general version to of partitioning
+def find_balanced_partitioning(mem_stats, ending_stats, n_mbatches, n_layers, n_gpus, predictor='bf', linear=False, endings=False, schedule="1f1b"):
+
+    # Brute-force:
+    if predictor == 'bf':
+        start = time.time()
+        results = []
+        best_peak = math.inf
+        best_i = []
+        for i, partitioning in enumerate(generate_partitionings(n_layers, n_gpus)):
+            prediction = predict(partitioning, mem_stats, ending_stats, n_mbatches, linear, endings, schedule)
+            # prediction = predict_early_stop(partitioning, mem_stats, best_peak)
+            peak = max(prediction)
+
+            if peak < best_peak:
+                # Reset list with best results.
+                best_i = [i]
+                best_peak = peak
+            elif peak == best_peak:
+                # Add to list of best results, so we can apply tie-breaking rule later.
+                best_i.append(i)
+        
+            results.append((partitioning, prediction))
+        # Apply the tie-breaker rule if there are multiple partitionings
+        # with the same highest peak memory usage.
+        best_i = tie_breaker(results, best_i, n_gpus)
+
+        end = time.time()
+
+        # Print the result.
+        print_bf_result(results, best_i, end-start)
+        partitioning = convert_to_forward_layers(results[best_i][0])
+    elif predictor == "bs":
+        start = time.time()
+        l, r = 0, 2**60 # binary search
+        # try to load memory on gpus in the begining, if there is a tie
+        while l <= r:
+            mid = (l + r) // 2
+            layers, pred = greedy_partition(mem_stats, ending_stats, n_mbatches, n_gpus, mid, linear, endings, schedule)
+            peak = max(pred)
+            if peak > mid:
+                l = mid + 1
+            else:
+                r = mid - 1
+                partitioning = layers
+                prediction = pred
+
+        end = time.time()
+        print_predictor_result(partitioning, prediction, max(prediction), end-start)
+    else:
+        raise NotImplementedError
+    return partitioning
+
+
 
 def main(slurm_filename, predictor='bf', n_gpus=None):
     partitionings, mem = read_input_alpa(slurm_filename)

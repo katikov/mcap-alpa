@@ -1,9 +1,10 @@
 import argparse
+import time
 
 def get_args():
     parser = argparse.ArgumentParser(description="Swin UNETR in alpa")
     parser.add_argument("--data_dir", default="/var/scratch/xouyang/LOFAR_Full_RFI_dataset.pkl", type=str, help="dataset directory")
-    parser.add_argument("--checkpoint", default=None, help="start training from saved checkpoint")
+    parser.add_argument("--checkpoint", default="./checkpoints", help="start training from saved checkpoint")
     parser.add_argument("--save_checkpoint", action="store_true", help="save checkpoint during training")
     parser.add_argument("--total_epochs", default=300, type=int, help="total number of training epochs")
     parser.add_argument("--warmup_epochs", default=20, type=int, help="number of warmup epochs")
@@ -14,7 +15,7 @@ def get_args():
     parser.add_argument("--size_x", default=512, type=int, help="image size in x direction")
     parser.add_argument("--size_y", default=512, type=int, help="image size in y direction")
     parser.add_argument("--val_every", default=1, type=int, help="validation frequency")
-    parser.add_argument("--feature_size", default=96, type=int, help="feature size")
+    # parser.add_argument("--feature_size", default=96, type=int, help="feature size")
     parser.add_argument("--optim_lr", default=1e-5, type=float, help="optimization learning rate")
     parser.add_argument("--decay", default=0.001, type=float, help="decay weight")
     parser.add_argument("--parallel_method", default="pipeshard", help="parallel method") # TODO: add description
@@ -29,69 +30,38 @@ def get_args():
     parser.add_argument("--worker_list", default=None, help="worker list")
     parser.add_argument("--reduced_profiling", action="store_true", help="profile with a smaller feature size")
     parser.add_argument("--pipeline_schedule", default="1f1b", help="pipeline schedule, can be \"1f1b\", \"gpipe\" or \"inference\"")
-    # parser.add_argument("--gpus_per_node", default=4, type=int, help="number of gpus per node")
-
+    parser.add_argument("--linear_predict", action="store_true", help="profile with batch size 1 and 2, then predict the memory usage with linear formula")
+    parser.add_argument("--endings", default=True, type=bool, help="enable ending trick in mcap prediction, true by default")
+    parser.add_argument('--no_endings', dest='endings', action='store_false')
+    parser.add_argument("--mcap_searching", default="bf", help="searching algorithm for mcap recommendation, bf (brute-force) by default, can be bo(for normal mcap) or bs(binary search for linear)")
+    parser.add_argument("--model_size", default="F", help="model size: F, T, S, B, L")
+    
+    
     args = parser.parse_args()
+
+    args.stages = (2, 2, 18, 2)
+    # TODO: get num_layers with auto layering
+    if args.model_size == "F":
+        args.feature_size = 24
+    elif args.model_size == "T":
+        args.feature_size = 96
+        args.stages = (2, 2, 6, 2)
+    elif args.model_size == "S":
+        args.feature_size = 96
+    elif args.model_size == "B":
+        args.feature_size = 144
+    elif args.model_size == "L":
+        args.feature_size = 192
+    else:
+        raise NotImplementedError
+
     if args.worker_list:
         args.worker_list = args.worker_list.split()
         args.gpus_per_node = args.num_gpus // len(args.worker_list)
+    # if args.pipeline_schedule == "gpipe" and args.linear_predict:
+    #     args.linear_predict = False
+    #     print("linear prediction is only available for 1f1b pipelining schedule!!!")
+    
+    if not args.profiling_file:
+        args.profiling_file = f"benchmark-{args.num_gpus}-{args.feature_size}-{int(time.time())}.pkl"
     return args
-
-    # TODO: check swin unetr params
-    """
-    orig swin unetr params
-    parser.add_argument("--logdir", default="test", type=str, help="directory to save the tensorboard logs")
-    parser.add_argument("--fold", default=0, type=int, help="data fold")
-    parser.add_argument("--pretrained_model_name", default="model.pt", type=str, help="pretrained model name")
-    parser.add_argument("--json_list", default="./jsons/brats21_folds.json", type=str, help="dataset json file")
-    
-    
-    parser.add_argument("--sw_batch_size", default=4, type=int, help="number of sliding window batch size")
-
-    parser.add_argument("--optim_name", default="adamw", type=str, help="optimization algorithm")
-    
-    parser.add_argument("--momentum", default=0.99, type=float, help="momentum")
-    parser.add_argument("--noamp", action="store_true", help="do NOT use amp for training")
-    
-    parser.add_argument("--distributed", action="store_true", help="start distributed training")
-    parser.add_argument("--world_size", default=1, type=int, help="number of nodes for distributed training")
-    parser.add_argument("--rank", default=0, type=int, help="node rank for distributed training")
-    parser.add_argument("--dist-url", default="tcp://127.0.0.1:23456", type=str, help="distributed url")
-    parser.add_argument("--dist-backend", default="nccl", type=str, help="distributed backend")
-    parser.add_argument("--norm_name", default="instance", type=str, help="normalization name")
-    parser.add_argument("--workers", default=8, type=int, help="number of workers")
-    
-
-    parser.add_argument("--cache_dataset", action="store_true", help="use monai Dataset class")
-    parser.add_argument("--a_min", default=-175.0, type=float, help="a_min in ScaleIntensityRanged")
-    parser.add_argument("--a_max", default=250.0, type=float, help="a_max in ScaleIntensityRanged")
-    parser.add_argument("--b_min", default=0.0, type=float, help="b_min in ScaleIntensityRanged")
-    parser.add_argument("--b_max", default=1.0, type=float, help="b_max in ScaleIntensityRanged")
-    parser.add_argument("--space_x", default=1.5, type=float, help="spacing in x direction")
-    parser.add_argument("--space_y", default=1.5, type=float, help="spacing in y direction")
-    parser.add_argument("--space_z", default=2.0, type=float, help="spacing in z direction")
-
-    parser.add_argument("--roi_z", default=96, type=int, help="roi size in z direction")
-    parser.add_argument("--dropout_rate", default=0.0, type=float, help="dropout rate")
-    parser.add_argument("--dropout_path_rate", default=0.0, type=float, help="drop path rate")
-    parser.add_argument("--RandFlipd_prob", default=0.2, type=float, help="RandFlipd aug probability")
-    parser.add_argument("--RandRotate90d_prob", default=0.2, type=float, help="RandRotate90d aug probability")
-    parser.add_argument("--RandScaleIntensityd_prob", default=0.1, type=float, help="RandScaleIntensityd aug probability")
-    parser.add_argument("--RandShiftIntensityd_prob", default=0.1, type=float, help="RandShiftIntensityd aug probability")
-    parser.add_argument("--infer_overlap", default=0.5, type=float, help="sliding window inference overlap")
-    parser.add_argument("--lrschedule", default="warmup_cosine", type=str, help="type of learning rate scheduler")
-    
-    parser.add_argument("--resume_ckpt", action="store_true", help="resume training from pretrained checkpoint")
-    parser.add_argument("--smooth_dr", default=1e-6, type=float, help="constant added to dice denominator to avoid nan")
-    parser.add_argument("--smooth_nr", default=0.0, type=float, help="constant added to dice numerator to avoid zero")
-    parser.add_argument("--use_checkpoint", action="store_true", help="use gradient checkpointing to save memory")
-    parser.add_argument("--spatial_dims", default=2, type=int, help="spatial dimension of input data")
-    parser.add_argument(
-        "--pretrained_dir",
-        default="./pretrained_models/fold1_f48_ep300_4gpu_dice0_9059/",
-        type=str,
-        help="pretrained checkpoint directory",
-    )
-    parser.add_argument("--squared_dice", action="store_true", help="use squared Dice")
-    parser.add_argument("--bce_loss", action="store_true", help="use bce loss")
-    """

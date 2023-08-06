@@ -11,6 +11,8 @@ from flax.training import checkpoints
 import os
 import sys
 import pickle as pkl
+import time
+import math
 from sklearn.metrics import (roc_curve,
                              auc, 
                              f1_score,
@@ -75,7 +77,7 @@ def eval_step(state, sample):
     
 def main():
     args = get_args()
-    args.stages = (2, 2, 18, 2)
+    
     if args.debug:
         args.warmup_epochs = 2
         args.total_epochs = 5
@@ -134,30 +136,40 @@ def main():
         start_epoch = (int(state.step) + 1) // (train_length//args.batch_size)
         print(f"Load from checkpoint, start epoch = {start_epoch}")
 
-    method = get_parallel_method(args, state, train_step, train_dataloader)
+    train_method, eval_method = get_parallel_method(args, state, train_step, train_dataloader)
     # method = alpa.PipeshardParallel(num_micro_batches=args.batch_size//args.mbatch_size,
     #             layer_option="manual",
     #             stage_option="auto")                 
-    p_train_step = alpa.parallelize(train_step, method=method)
+    p_train_step = alpa.parallelize(train_step, method=train_method)
 
-    p_eval_step = alpa.parallelize(eval_step, donate_argnums=())
+    p_eval_step = alpa.parallelize(eval_step, method=eval_method, donate_argnums=())
 
 
-
+    train_time_list = []
+    compile_flag = False
     for epoch in range(start_epoch, args.total_epochs):
-
         train_step_progress_bar = tqdm.tqdm(total=len(train_dataset)//args.batch_size, desc="Training...")
         # train
         train_metrics = []
+        
         for step, batch in enumerate(train_dataloader):
             batch = {"sample": jnp.array(batch[0]), "labels": jnp.array(batch[1])}
+            start_time = time.monotonic()
             state, train_metric = p_train_step(state, batch)
             loss = train_metric["loss"]._value
+            end_time = time.monotonic()
+            if not compile_flag:
+                compile_flag = True
+            elif len(train_time_list) <= 10**6: 
+                train_time_list.append(end_time - start_time)
             train_metrics.append(loss)
             # print(f"epoch: {epoch}, step: {step}, loss: {loss}")
             train_step_progress_bar.set_description(f"Training epoch: {epoch}, loss: {loss}")
             train_step_progress_bar.update(1)
-            
+        
+
+        
+
         train_step_progress_bar.close()
 
         avg_loss = np.mean(train_metrics)
@@ -165,7 +177,7 @@ def main():
 
         if args.val_every > 0 and (epoch + 1) % args.val_every == 0:
             if args.save_checkpoint:
-                save_checkpoint(state, "./checkpoints/")
+                save_checkpoint(state, args.checkpoint)
 
             acc_logit = []
             acc_target = []
@@ -212,9 +224,11 @@ def main():
     # alpa_executable = p_train_step.get_last_executable()
     batch = {"sample": jnp.ones((args.batch_size, args.size_x, args.size_y, args.in_channels), dtype="float32"), 
                     "labels": jnp.ones((args.batch_size, args.size_x, args.size_y, args.out_channels), dtype="int32")}
-    if isinstance(method, (alpa.PipeshardParallel,)):
+    mean_time = math.inf if len(train_time_list) == 0 else sum(train_time_list) / len(train_time_list)
+    if isinstance(train_method, (alpa.PipeshardParallel,)):
         # alpa_executable = p_train_step.get_executable(state, batch)
         alpa_executable = p_train_step.get_last_executable()
+        flops = alpa_executable.flop_count / 1e12
         print(f"Alpa maximum GPU memory usage:   {alpa_executable.mesh_group.get_max_memory_allocated() / (2**30):.2f} GB")
         def _get_mem_list(mesh_group):
             calls = []
@@ -228,9 +242,10 @@ def main():
     else:
         state, batch = p_train_step.preshard_dynamic_args(state, batch)
         alpa_executable = p_train_step.get_executable(state, batch)
+        flops = alpa_executable.flop_count
         print(f"Alpa execution per GPU memory usage:   {alpa_executable.get_total_allocation_size() / (2**30):.2f} GB")
 
-
+    print(f"Model size: {flops}, mean iteration time: {mean_time}, alpa throughput: {flops/mean_time}")
 
 if __name__ == "__main__":
     main()
